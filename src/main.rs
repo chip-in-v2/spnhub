@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initial start
     reconcile_hubs(&initial_config, &mut running_hubs, shared_config.clone()).await;
 
-    info!("All hubs started. Waiting for connections...");
+    info!("Started {} hubs. Waiting for connections...", running_hubs.len());
 
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -267,7 +267,7 @@ async fn reconcile_hubs(
         for hub in &realm.hubs {
             let key = (realm.realm_name.clone(), hub.name.clone());
             if !running_hubs.contains_key(&key) {
-                info!("Starting hub: {} (Realm: {})", hub.name, realm.realm_name);
+                info!("Starting hub: {} (Realm: {}) on host: {}", hub.name, realm.realm_name, hub.server_address);
                 match start_hub(realm, hub, shared_config.clone()).await {
                     Ok(running_hub) => {
                         running_hubs.insert(key, running_hub);
