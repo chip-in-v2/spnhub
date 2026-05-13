@@ -156,6 +156,10 @@ mod docker_backend {
             "Docker: Starting container."
         );
 
+        info!(
+            endpoint = "/containers/create",
+            "Docker: Calling API."
+        );
         // Prepare connection to the Unix domain socket. Involves I/O but is a very lightweight synchronous operation.
         let docker = Docker::connect_with_local_defaults()?;
         // Generate container name (sanitization process)
@@ -258,7 +262,10 @@ mod docker_backend {
             .start_container(&container_name, None::<StartContainerOptions>)
             .await
         {
-            Ok(_) => info!("Docker: Container {} started.", container_name),
+            Ok(_) => {
+                info!(endpoint = format!("/containers/{}/start", container_name), "Docker: Calling API.");
+                info!("Docker: Container {} started.", container_name);
+            },
             Err(DockerError::DockerResponseServerError {
                 status_code: 304, ..
             }) => {
@@ -280,6 +287,11 @@ mod docker_backend {
             service_id.replace(|c: char| !c.is_alphanumeric(), "_")
         );
 
+        info!(
+            endpoint = format!("/containers/{}/stop", container_name),
+            "Docker: Calling API."
+        );
+
         // Stop with 10s timeout
         let stop_options = Some(StopContainerOptions {
             signal: None,
@@ -297,6 +309,11 @@ mod docker_backend {
         } else {
             info!("Docker: Container {} stopped.", container_name);
         }
+
+        info!(
+            endpoint = format!("/containers/{}", container_name),
+            "Docker: Calling API (Delete)."
+        );
 
         // Forced removal (removes if stopped)
         let remove_options = Some(RemoveContainerOptions {
@@ -331,7 +348,7 @@ mod docker_backend {
 
 mod k8s_backend {
     use super::*;
-    use kube::{Client, Api, Config, api::{Patch, PatchParams}};
+    use kube::{Client, Api, Config, Resource, api::{Patch, PatchParams}};
     use k8s_openapi::api::apps::v1::Deployment;
     use serde_json::json;
 
@@ -383,16 +400,25 @@ mod k8s_backend {
         }
 
         // Initialize client
-        let client = Client::try_from(k8s_config)?;
+        let client = Client::try_from(k8s_config.clone())?;
         let deployments: Api<Deployment> = Api::namespaced(client, namespace);
 
+        // Construct the full URL using the library's resource path logic
         let name = &config.service_id;
+        let base_url = k8s_config.cluster_url.to_string();
+        let api_path = Deployment::url_path(&(), Some(namespace));
+        let full_url = format!(
+            "{}/{}/{}",
+            base_url.trim_end_matches('/'),
+            api_path.trim_start_matches('/'),
+            name
+        );
 
         info!(
-            namespace = namespace,
+            url = %full_url,
             deployment = name,
             count = count,
-            "Kubernetes: Scaling deployment."
+            "Kubernetes: Calling API to scale deployment."
         );
 
         // Create patch data for replica count
@@ -438,13 +464,6 @@ mod nomad_backend {
         let url = format!("{}/scale", base_url);
         let group_id = &config.image;
 
-        info!(
-            url = %url,
-            group = group_id,
-            count = count,
-            "Nomad: Scaling task."
-        );
-
         let body = json!({
             "Target": { "Group": group_id },
             "Count": count,
@@ -457,7 +476,7 @@ mod nomad_backend {
 
         // Initialize client and request
         let client = reqwest::Client::new();
-        let mut request = client.post(url).json(&body);
+        let mut request_builder = client.post(url).json(&body);
 
         // Inject Nomad Token if ACCESS_TOKEN is provided in config env
         if let Some(token) = config.env.as_ref().and_then(|m| m.get("ACCESS_TOKEN")) {
@@ -467,12 +486,21 @@ mod nomad_backend {
                 "***".to_string()
             };
             info!("Nomad: Injecting ACCESS_TOKEN ({})", masked);
-            request = request.header("X-Nomad-Token", token);
+            request_builder = request_builder.header("X-Nomad-Token", token);
         } else {
             info!("Nomad: No ACCESS_TOKEN injected.");
         }
 
-        let response = request.send().await?;
+        // Build the actual request to extract the final resolved URL for logging
+        let request = request_builder.build()?;
+        info!(
+            url = %request.url(),
+            group = group_id,
+            count = count,
+            "Nomad: Calling API to scale task."
+        );
+
+        let response = client.execute(request).await?;
 
         if !response.status().is_success() {
             let status = response.status();
