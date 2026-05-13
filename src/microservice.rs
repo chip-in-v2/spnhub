@@ -4,19 +4,27 @@
 //!
 //! It handles:
 //! - Spawning (starting) providers.
-//! - Stopping and removing providers.
-//! - (Planned) Monitoring health.
+//! - Stopping (scaling down) and removing providers.
 //!
 //! ## Runtime Assumptions
-//! - Supports **Docker** and **Nomad** as backends.
-//! - The backend is selected based on the `clusterManagerUrn` prefix (e.g., `nomad:`).
+//! - Supports **Docker**, **Nomad**, and **Kubernetes** as backends.
+//! - Backend selection is based on the `clusterManagerUrn` prefix:
+//!   - `docker:`: Local container management.
+//!   - `nomad:`: Nomad Job/Task scaling.
+//!   - `k8s:`: Kubernetes Deployment scaling.
+//!
+//! ## Connection & Authentication
+//! - **Docker**: Connects via local Unix domain socket.
+//! - **Nomad/Kubernetes**: Connects via HTTP/HTTPS APIs.
+//!   - If `ACCESS_TOKEN` is provided in `AvailabilityManagementConfig.env`, it is injected as a Bearer token (K8s) or `X-Nomad-Token` (Nomad).
+//!   - Token injection is logged with masking (showing only the first and last 3 characters).
 //!
 //! ## Security Note
-//! - This design assumes that the configuration file is benevolent and fully trusted.
-//! - No extensive validation or sanitization is performed on parameters such as `options`, `command`, or `env`.
+//! - Configuration is assumed to be trusted.
+//! - Limited sanitization is performed on parameters like `options`, `command`, or `env`.
 //!
 //! ## Concurrency Model
-//! - Uses asynchronous APIs via `tokio` to avoid blocking the main event loop.
+//! - Uses asynchronous APIs to avoid blocking the event loop.
 //!
 //! ## API Surface
 //! - `start_provider`: Asynchronously starts a provider using the configured backend.
@@ -24,6 +32,7 @@
 
 use crate::config::AvailabilityManagementConfig;
 use std::collections::HashMap;
+use tracing::{debug, error, info, warn};
 
 // --- Public Interface Definitions ---
 
@@ -41,6 +50,8 @@ pub enum StartError {
     Docker(#[from] bollard::errors::Error),
     #[error("Nomad error: {0}")]
     Nomad(#[from] reqwest::Error),
+    #[error("Kubernetes error: {0}")]
+    K8s(#[from] kube::Error),
     #[error("Error: {0}")]
     Other(String),
 }
@@ -52,31 +63,31 @@ pub enum StopError {
     Docker(#[from] bollard::errors::Error),
     #[error("Nomad error: {0}")]
     Nomad(#[from] reqwest::Error),
+    #[error("Kubernetes error: {0}")]
+    K8s(#[from] kube::Error),
     #[error("Error: {0}")]
     Other(String),
 }
 
-/// Starts a container for the specified provider configuration.
-///
-/// This function looks up the container image associated with the provided URN
-/// in the application configuration and starts it.
+/// Routes the start request to the appropriate backend based on the URN prefix.
 pub async fn start_provider(
     config: &AvailabilityManagementConfig,
 ) -> Result<ContainerHandle, StartError> {
-    let is_nomad = config
-        ._cluster_manager_urn
-        .as_deref()
-        .map(|urn| urn.starts_with("nomad:"))
-        .unwrap_or(false);
+    let urn = config._cluster_manager_urn.as_deref().ok_or_else(|| {
+        StartError::Other("clusterManagerUrn is required but missing".to_string())
+    })?;
 
-    let result = if is_nomad {
-        match nomad_backend::scale_task(config, 1).await {
-            Ok(_) => Ok(ContainerHandle {
-                id: config.service_id.clone(),
-            }),
-            Err(e) => Err(StartError::Other(e.to_string())),
-        }
-    } else {
+    let result = if urn.starts_with("k8s:") {
+        k8s_backend::scale_deployment(config, 1)
+            .await
+            .map(|_| ContainerHandle { id: config.service_id.clone() })
+            .map_err(|e| StartError::Other(e.to_string()))
+    } else if urn.starts_with("nomad:") {
+        nomad_backend::scale_task(config, 1)
+            .await
+            .map(|_| ContainerHandle { id: config.service_id.clone() })
+            .map_err(|e| StartError::Other(e.to_string()))
+    } else if urn.starts_with("docker:") {
         docker_backend::start_container(
             &config.image,
             config.options.as_deref(),
@@ -85,29 +96,35 @@ pub async fn start_provider(
             config.command.as_deref(),
         )
         .await
+    } else {
+        Err(StartError::Other(format!("Unsupported cluster manager URN: {}", urn)))
     };
 
     match &result {
-        Ok(handle) => tracing::info!("start_provider result: success, id={}", handle.id),
-        Err(e) => tracing::info!("start_provider result: failure, error={}", e),
+        Ok(handle) => info!("start_provider result: success, id={}", handle.id),
+        Err(e) => info!("start_provider result: failure, error={}", e),
     }
     result
 }
 
-/// Stops and removes a microservice container.
+/// Routes the stop request to the appropriate backend based on the URN prefix.
 pub async fn stop_provider(config: &AvailabilityManagementConfig) -> Result<(), StopError> {
-    let is_nomad = config
-        ._cluster_manager_urn
-        .as_deref()
-        .map(|urn| urn.starts_with("nomad:"))
-        .unwrap_or(false);
+    let urn = config._cluster_manager_urn.as_deref().ok_or_else(|| {
+        StopError::Other("clusterManagerUrn is required but missing".to_string())
+    })?;
 
-    if is_nomad {
+    if urn.starts_with("k8s:") {
+        k8s_backend::scale_deployment(config, 0)
+            .await
+            .map_err(|e| StopError::Other(e.to_string()))
+    } else if urn.starts_with("nomad:") {
         nomad_backend::scale_task(config, 0)
             .await
             .map_err(|e| StopError::Other(e.to_string()))
-    } else {
+    } else if urn.starts_with("docker:") {
         docker_backend::stop_container(&config.service_id).await
+    } else {
+        Err(StopError::Other(format!("Unsupported or invalid cluster manager URN prefix: {}", urn)))
     }
 }
 
@@ -130,11 +147,11 @@ mod docker_backend {
         env: Option<&HashMap<String, String>>,
         command: Option<&[String]>,
     ) -> Result<ContainerHandle, StartError> {
-        tracing::info!(
-            serviceId = service_id,
+        debug!(
+            service_id,
             image,
-            options = ?options,
-            env = ?env,
+            ?options,
+            ?env,
             command = ?command,
             "Docker: Starting container."
         );
@@ -221,7 +238,7 @@ mod docker_backend {
             ..Default::default()
         };
 
-        // Create the container asynchronously
+        // Create or find existing container
         let id = match docker.create_container(Some(create_options), config).await {
             Ok(c) => c.id,
             Err(DockerError::DockerResponseServerError {
@@ -236,16 +253,16 @@ mod docker_backend {
             Err(e) => return Err(e.into()),
         };
 
-        // Start the container asynchronously
+        // Start the container
         match docker
             .start_container(&container_name, None::<StartContainerOptions>)
             .await
         {
-            Ok(_) => tracing::info!("Docker: Container {} started.", container_name),
+            Ok(_) => info!("Docker: Container {} started.", container_name),
             Err(DockerError::DockerResponseServerError {
                 status_code: 304, ..
             }) => {
-                tracing::info!("Docker: Container {} is already running.", container_name);
+                info!("Docker: Container {} is already running.", container_name);
             }
             Err(e) => return Err(e.into()),
         }
@@ -255,7 +272,7 @@ mod docker_backend {
 
     /// Stops and removes a Docker container asynchronously.
     pub async fn stop_container(service_id: &str) -> Result<(), StopError> {
-        tracing::info!(serviceId = service_id, "Docker: Stopping container.");
+        info!(serviceId = service_id, "Docker: Stopping container.");
 
         let docker = Docker::connect_with_local_defaults()?;
         let container_name = format!(
@@ -263,7 +280,7 @@ mod docker_backend {
             service_id.replace(|c: char| !c.is_alphanumeric(), "_")
         );
 
-        // Asynchronous stop with a 10-second timeout
+        // Stop with 10s timeout
         let stop_options = Some(StopContainerOptions {
             signal: None,
             t: Some(10),
@@ -273,12 +290,12 @@ mod docker_backend {
                 status_code: 404, ..
             } = e
             {
-                tracing::info!("Docker: Container {} not found.", container_name);
+                info!("Docker: Container {} not found.", container_name);
             } else {
                 return Err(e.into());
             }
         } else {
-            tracing::info!("Docker: Container {} stopped.", container_name);
+            info!("Docker: Container {} stopped.", container_name);
         }
 
         // Forced removal (removes if stopped)
@@ -296,15 +313,88 @@ mod docker_backend {
             {
                 // Already removed
             } else {
-                tracing::warn!(
+                warn!(
                     "Docker: Failed to remove container {}: {}",
                     container_name,
                     e
                 );
             }
         } else {
-            tracing::info!("Docker: Container {} removed.", container_name);
+            info!("Docker: Container {} removed.", container_name);
         }
+
+        Ok(())
+    }
+}
+
+// --- Kubernetes Backend Implementation ---
+
+mod k8s_backend {
+    use super::*;
+    use kube::{Client, Api, Config, api::{Patch, PatchParams}};
+    use k8s_openapi::api::apps::v1::Deployment;
+    use serde_json::json;
+
+    /// Scales a Kubernetes Deployment to the specified replica count.
+    ///
+    /// Expects URN format `k8s:<namespace>`.
+    /// Uses `service_id` as the Deployment name.
+    pub async fn scale_deployment(
+        config: &AvailabilityManagementConfig,
+        count: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let urn = config
+            ._cluster_manager_urn
+            .as_deref()
+            .ok_or("Kubernetes cluster manager URN is missing")?;
+
+        let namespace = urn
+            .strip_prefix("k8s:")
+            .ok_or("Invalid Kubernetes URN prefix (must start with 'k8s:')")?;
+
+        // Use "default" namespace if empty
+        let namespace = if namespace.is_empty() { "default" } else { namespace };
+
+        // Load base config from environment
+        let mut k8s_config = Config::infer().await?;
+
+        // Override bearer token if ACCESS_TOKEN is provided in config env
+        if let Some(token) = config.env.as_ref().and_then(|m| m.get("ACCESS_TOKEN")) {
+            let masked = if token.len() >= 6 {
+                format!("{}...{}", &token[..3], &token[token.len() - 3..])
+            } else {
+                "***".to_string()
+            };
+            info!("Kubernetes: Injecting ACCESS_TOKEN ({})", masked);
+            k8s_config.auth_info.token = Some(token.clone().into());
+        } else {
+            info!("Kubernetes: No ACCESS_TOKEN injected.");
+        }
+
+        // Initialize client
+        let client = Client::try_from(k8s_config)?;
+        let deployments: Api<Deployment> = Api::namespaced(client, namespace);
+
+        let name = &config.service_id;
+
+        info!(
+            namespace = namespace,
+            deployment = name,
+            count = count,
+            "Kubernetes: Scaling deployment."
+        );
+
+        // Create patch data for replica count
+        let patch = json!({
+            "spec": {
+                "replicas": count
+            }
+        });
+
+        // Apply Strategic Merge Patch
+        deployments
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
 
         Ok(())
     }
@@ -317,6 +407,9 @@ mod nomad_backend {
     use serde_json::json;
 
     /// Scales a Nomad task group to the specified count.
+    ///
+    /// Expects URN format `nomad:<api_url>`.
+    /// Uses `image` (task group name) as the scaling target.
     pub async fn scale_task(
         config: &AvailabilityManagementConfig,
         count: i32,
@@ -334,7 +427,7 @@ mod nomad_backend {
         let url = format!("{}/scale", base_url);
         let group_id = &config.image;
 
-        tracing::info!(
+        info!(
             url = %url,
             group = group_id,
             count = count,
@@ -346,13 +439,29 @@ mod nomad_backend {
             "Count": count,
             "ErrorOnConflict": false
         });
-        tracing::debug!(
+        debug!(
             "Nomad API Request Body: {}",
             serde_json::to_string(&body).unwrap_or_default()
         );
 
+        // Initialize client and request
         let client = reqwest::Client::new();
-        let response = client.post(url).json(&body).send().await?;
+        let mut request = client.post(url).json(&body);
+
+        // Inject Nomad Token if ACCESS_TOKEN is provided in config env
+        if let Some(token) = config.env.as_ref().and_then(|m| m.get("ACCESS_TOKEN")) {
+            let masked = if token.len() >= 6 {
+                format!("{}...{}", &token[..3], &token[token.len() - 3..])
+            } else {
+                "***".to_string()
+            };
+            info!("Nomad: Injecting ACCESS_TOKEN ({})", masked);
+            request = request.header("X-Nomad-Token", token);
+        } else {
+            info!("Nomad: No ACCESS_TOKEN injected.");
+        }
+
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -360,7 +469,7 @@ mod nomad_backend {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Empty response body".to_string());
-            tracing::error!(
+            error!(
                 "Nomad API error response: status={}, body={}",
                 status,
                 error_text
