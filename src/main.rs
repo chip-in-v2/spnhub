@@ -116,9 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
     // QUIC setup
-    default_provider()
-        .install_default()
-        .expect("Failed to install crypto provider");
+    //default_provider()
+    //    .install_default()
+    //    .expect("Failed to install crypto provider");
 
     // TLS intercept - Temporary workaround; revisit for cleaner implementation in Quinn 0.12.
     tls_kx_intercept::install_intercept_provider();
