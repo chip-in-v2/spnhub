@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use rustls::crypto::ring::default_provider;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::{self, Duration, Instant};
@@ -115,12 +114,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let args = Args::parse();
 
-    // QUIC setup
-    //default_provider()
+    // QUIC setup (normal)
+    // default_provider()
     //    .install_default()
     //    .expect("Failed to install crypto provider");
 
-    // TLS intercept - Temporary workaround; revisit for cleaner implementation in Quinn 0.12.
+    // QUIC setup with TLS intercept - Temporary workaround; revisit for cleaner implementation in Quinn 0.12.
     tls_kx_intercept::install_intercept_provider();
 
     info!(

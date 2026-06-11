@@ -29,7 +29,7 @@ impl SupportedKxGroup for InterceptingKxGroup {
 }
 
 pub fn install_intercept_provider() {
-    let mut provider = rustls::crypto::ring::default_provider();
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
 
     let mut wrapped_groups: Vec<&'static dyn SupportedKxGroup> = Vec::new();
 
