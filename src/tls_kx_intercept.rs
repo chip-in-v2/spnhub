@@ -17,7 +17,6 @@ impl SupportedKxGroup for InterceptingKxGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange + 'static>, rustls::Error> {
         let group_name = self.inner.name();
 
-        println!("[TLS Intercept] TLS Key Exchange Group negotiated: {:?}", group_name);
         info!("TLS Key Exchange Group negotiated: {:?}", group_name);
 
         self.inner.start()
