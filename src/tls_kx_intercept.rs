@@ -8,7 +8,6 @@ use rustls::crypto::{ActiveKeyExchange, SupportedKxGroup};
 use rustls::NamedGroup;
 use tracing::info;
 
-/// Wrapper to hook key exchange and log the result.
 #[derive(Debug)]
 struct InterceptingKxGroup {
     inner: &'static dyn SupportedKxGroup,
@@ -16,8 +15,11 @@ struct InterceptingKxGroup {
 
 impl SupportedKxGroup for InterceptingKxGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange + 'static>, rustls::Error> {
-        // Log the negotiated group immediately upon selection.
-        info!("TLS Key Exchange Group negotiated: {:?}", self.inner.name());
+        let group_name = self.inner.name();
+
+        println!("[TLS Intercept] TLS Key Exchange Group negotiated: {:?}", group_name);
+        info!("TLS Key Exchange Group negotiated: {:?}", group_name);
+
         self.inner.start()
     }
 
@@ -26,21 +28,26 @@ impl SupportedKxGroup for InterceptingKxGroup {
     }
 }
 
-/// Installs a provider that wraps all default KX groups. Call once during initialization.
 pub fn install_intercept_provider() {
     let mut provider = rustls::crypto::ring::default_provider();
-    
+
     let mut wrapped_groups: Vec<&'static dyn SupportedKxGroup> = Vec::new();
-    
-    // Wrap existing KX groups and leak them to satisfy 'static lifetime.
+
     for group in provider.kx_groups {
         let wrapped = InterceptingKxGroup { inner: group };
         let leaked: &'static dyn SupportedKxGroup = Box::leak(Box::new(wrapped));
         wrapped_groups.push(leaked);
     }
-    
+
     provider.kx_groups = wrapped_groups;
-    
-    // Register as the default crypto provider.
-    let _ = rustls::crypto::CryptoProvider::install_default(provider);
+
+    match rustls::crypto::CryptoProvider::install_default(provider) {
+        Ok(_) => {
+            eprintln!("[TLS Intercept] Custom CryptoProvider installed successfully.");
+        }
+        Err(_) => {
+            eprintln!("[TLS Intercept] ERROR: Failed to install custom CryptoProvider because a default was already installed!");
+            eprintln!("[TLS Intercept] Hint: Call `install_intercept_provider()` at the absolute beginning of your `main` function (before any Quinn config or endpoints are touched).");
+        }
+    }
 }
