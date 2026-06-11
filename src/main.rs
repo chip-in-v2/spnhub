@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod microservice;
 mod utils;
+mod tls_kx_intercept;
 
 use crate::config::{
     AppConfig, ConfigHotReloadService, HubConfig, RealmConfig, load_initial_config,
@@ -118,6 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     default_provider()
         .install_default()
         .expect("Failed to install crypto provider");
+
+    // TLS intercept - Temporary workaround; revisit for cleaner implementation in Quinn 0.12.
+    tls_kx_intercept::install_intercept_provider();
 
     info!(
         "SPN Hub Server started (Version: {}, PID: {}) with inventory configuration: {}",
