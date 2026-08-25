@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::{self, Duration, Instant};
@@ -74,6 +74,16 @@ struct Args {
         default_value = "http://localhost:3000/v1"
     )]
     config: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands.
+#[derive(Subcommand)]
+enum Command {
+    /// Print third-party licensing information and exit.
+    License,
 }
 
 /// Holds service information looked up from the config.
@@ -112,6 +122,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     let args = Args::parse();
+
+    // `spnhub license`: show the third-party notices bundled into the binary and exit.
+    if let Some(Command::License) = args.command {
+        print!("{}", include_str!("../THIRD_PARTY_LICENSES.txt"));
+        return Ok(());
+    }
 
     // Installs the default crypto provider used by QUIC.
     rustls::crypto::aws_lc_rs::default_provider()
